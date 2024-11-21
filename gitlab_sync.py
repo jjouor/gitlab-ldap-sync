@@ -1,30 +1,16 @@
 #!/usr/bin/env python3
-"""
-Syncing users in gitlab with ldap provider.
-Only one porovider are supported.
-Sync users:
-- attributes (fields)
-- Ban if user exclude from access group or have expired password 2 days ago
-- Unban if user return access or update password
-Sync user fields:
-- admin (LDAP: by group)
-- name (LDAP: displayName attribute)
-- SSH keys (LDAP: ipaSshPubKey attribute)
-Sync groups:
-- Doesn.t create non-existing groups
-- Syncing users by members on ldap
-- Doesn.t remove users which not managed by ldap
-Version 2 at 03.2023
-"""
 # -*- coding: utf-8 -*-
 # pylint: disable=line-too-long,import-error,no-member
 
 import os
 import logging
 import datetime
+from xml.sax import parse
+
 import gitlab
 import ldap
 import ldap.asyncsearch
+import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,11 +19,9 @@ class GitlabSync:
     """
     Sync gitlab users/groups with freeipa ldap
     """
-
     def __init__(self):
         sync_dry_run_env = os.getenv('SYNC_DRY_RUN')
         self.sync_dry_run = sync_dry_run_env if sync_dry_run_env else ''
-
         gitlab_api_url_env = os.getenv('GITLAB_API_URL')
         self.gitlab_api_url = gitlab_api_url_env if gitlab_api_url_env else ''
         gitlab_token_env = os.getenv('GITLAB_TOKEN')
@@ -60,33 +44,18 @@ class GitlabSync:
         self.ldap_gitlab_admin_group = ldap_gitlab_admin_group_env if ldap_gitlab_admin_group_env else 'gitlab-admins'
         ldap_gitlab_group_prefix_env = os.getenv('LDAP_GITLAB_GROUP_PREFIX')
         self.ldap_gitlab_group_prefix = ldap_gitlab_group_prefix_env if ldap_gitlab_group_prefix_env else 'gitlab-group-'
+        ldap_gitlab_subgroup_prefix_env = os.getenv('LDAP_GITLAB_SUBGROUP_PREFIX')
+        self.ldap_gitlab_subgroup_prefix = ldap_gitlab_subgroup_prefix_env if ldap_gitlab_subgroup_prefix_env else 'gitlab-subgroup-'
 
         # pylint: disable=invalid-name
         self.gl = None
         self.ldap_obj = None
         self.ldap_gitlab_users = {}
-        self.expired_ldap_gitlab_users = []
-        date_expiration = datetime.datetime.now() - datetime.timedelta(days=2)
-        password_expiration_border_date = date_expiration.strftime(
-            "%Y%m%d%H%M%SZ")
-        self.user_filter = f"(&(memberof=cn={self.ldap_gitlab_users_group},{self.ldap_group_base_dn})(!(nsaccountlock=TRUE)))"
-        self.user_filter_with_uid = "(uid=%s)"
+        self.user_filter = f"(&(memberof=cn={self.ldap_gitlab_users_group},{self.ldap_group_base_dn}))"
+        self.user_filter_with_uid = "(sAMAccountName=%s)"
         self.groups_memberof_filter = f"(memberof=cn=%s,{self.ldap_group_base_dn})"
-        self.expired_user_filter = f"(&(memberof=cn={self.ldap_gitlab_users_group},{self.ldap_group_base_dn})(!(nsaccountlock=TRUE))(krbPasswordExpiration<={password_expiration_border_date}))"
-        self.admin_user_filter = f"(&(memberof=cn={self.ldap_gitlab_admin_group},{self.ldap_group_base_dn})(!(nsaccountlock=TRUE)))"
+        self.admin_user_filter = f"(&(memberof=cn={self.ldap_gitlab_admin_group},{self.ldap_group_base_dn}))"
 
-        gitlab_group_default_access_level_env = os.getenv('GITLAB_GROUP_DEFAULT_ACCESS_LEVEL')
-        self.gitlab_group_default_access_level = gitlab.const.DEVELOPER_ACCESS
-        if gitlab_group_default_access_level_env == "owner":
-            self.gitlab_group_default_access_level = gitlab.const.OWNER_ACCESS
-        if gitlab_group_default_access_level_env == "maintainer":
-            self.gitlab_group_default_access_level = gitlab.const.MAINTAINER_ACCESS
-        if gitlab_group_default_access_level_env == "developer":
-            self.gitlab_group_default_access_level = gitlab.const.DEVELOPER_ACCESS
-        if gitlab_group_default_access_level_env == "reporter":
-            self.gitlab_group_default_access_level = gitlab.const.REPORTER_ACCESS
-        if gitlab_group_default_access_level_env == "guest":
-            self.gitlab_group_default_access_level = gitlab.const.GUEST_ACCESS
         logging.info('Initialize gitlab-ldap-sync')
 
     def check_config(self):
@@ -129,9 +98,12 @@ class GitlabSync:
             if is_not_connected > 0:
                 logging.error("Cannot connect, exit sync class")
                 return
+            self.sync_ldap_groups()
+            self.create_user()
             self.search_all_users_in_ldap()
             self.sync_gitlab_users()
             self.sync_gitlab_groups()
+            self.sync_gitlab_subgroups()
         except Exception as expt:  # pylint: disable=broad-exception-caught
             logging.error("Cannot sync, received exception %s", expt)
             return
@@ -178,54 +150,75 @@ class GitlabSync:
         Search users in LDAP using filter
         """
         # pylint: disable=invalid-name
+        ldap_users = [ ]
         for dn, user in self.ldap_obj.search_s(base=self.ldap_users_base_dn,
                                                scope=ldap.SCOPE_SUBTREE,
                                                filterstr=self.user_filter,
-                                               attrlist=['uid',
+                                               attrlist=['sAMAccountName',
                                                          'displayName',
-                                                         'ipaSshPubKey']):
-            if 'uid' not in user:
+                                                         'userPrincipalName']):
+            if 'sAMAccountName' not in user:
                 continue
-            username = user['uid'][0].decode('utf-8')
+            username = user['sAMAccountName'][0].decode('utf-8')
+            mail = user['userPrincipalName'][0].decode('utf-8')
             self.ldap_gitlab_users[username] = {
                 'admin': False,
                 'displayName': user['displayName'][0].decode('utf-8'),
                 'dn': dn,
-                'ipaSshPubKey': user['ipaSshPubKey'] if 'ipaSshPubKey' in user else []
+                'mail': mail
             }
+
+            ldap_users.append(username)
         for dn, user in self.ldap_obj.search_s(base=self.ldap_users_base_dn,
                                                scope=ldap.SCOPE_SUBTREE,
                                                filterstr=self.admin_user_filter,
-                                               attrlist=['uid']):
-            if 'uid' not in user:
+                                               attrlist=['sAMAccountName']):
+            if 'sAMAccountName' not in user:
                 continue
-            username = user['uid'][0].decode('utf-8')
+            username = user['sAMAccountName'][0].decode('utf-8')
             if username in self.ldap_gitlab_users:
                 self.ldap_gitlab_users[username]['admin'] = True
             else:
                 logging.warning(
                     'User %s in admin group but does not have accesss to gitlab',
                     user.username)
-        self.expired_ldap_gitlab_users = []
-        for dn, user in self.ldap_obj.search_s(base=self.ldap_users_base_dn,
-                                               scope=ldap.SCOPE_SUBTREE,
-                                               filterstr=self.expired_user_filter, attrlist=['uid']):
-            if 'uid' not in user:
-                continue
-            username = user['uid'][0].decode('utf-8')
-            self.expired_ldap_gitlab_users.append(username)
+        return ldap_users
+
+
+    def create_user(self):
+        ldap_users = self.search_all_users_in_ldap()
+        for user in ldap_users:
+            gitlab_users = self.get_gitlab_user_by_username(user)
+            if not gitlab_users:
+
+                user_email = self.ldap_gitlab_users[user]['mail']
+                user_name = self.ldap_gitlab_users[user]['displayName']
+                user_dn = self.ldap_gitlab_users[user]['dn']
+                logging.info(f"User {user_name} is not exists")
+                if not self.sync_dry_run:
+                    self.gl.users.create({'email': f'{user_email}',
+                                            'password': 's3cur3s3cr3T',
+                                            'username': f'{user}',
+                                            'name': f'{user_name}',
+                                            'provider': f'{self.gitlab_ldap_provider}',
+                                            'extern_uid': f'{user_dn}',
+                                            'skip_confirmation': 'true'
+                                            })
+                logging.info (f"User {user_name} successfully created ")
+
+
 
     def is_ldap_user_exist(self, username):
         """
-        Search user in LDAP using filter by uisername
+        Search user in LDAP using filter by username
         """
         # pylint: disable=invalid-name
         for _, user in self.ldap_obj.search_s(base=self.ldap_users_base_dn,
                                               scope=ldap.SCOPE_SUBTREE,
                                               filterstr=(
                                                   self.user_filter_with_uid % username),
-                                              attrlist=['uid']):
-            if 'uid' not in user:
+                                              attrlist=['sAMAccountName']):
+            if 'sAMAccountName' not in user:
                 continue
             return True
         return False
@@ -262,6 +255,114 @@ class GitlabSync:
                 'User %s unbanned',
                 user.username)
 
+    def parse_group_name(self, group_name):
+        """
+        Parse ldap groups for better comparison with gitlab groups
+        and divide into groups and subgroups
+        """
+        result = {}
+        subgroup_pattern = fr"^{self.ldap_gitlab_subgroup_prefix}(.+?)-(.+?)-(?:guest|developer|owner|maintainer|reporter)$"
+        group_pattern = fr"^{self.ldap_gitlab_group_prefix}(.+?)-(?:guest|developer|owner|maintainer|reporter)$"
+        match_subgroup = re.match(subgroup_pattern, group_name)
+        if match_subgroup:
+            result['type'] = "subgroup"
+            result['mother_group'] = match_subgroup.group(1).replace('-',' ')
+            result['group_name'] = match_subgroup.group(2).replace('-', ' ')
+            return result
+        match_group = re.match(group_pattern, group_name)
+        if match_group:
+            result['type'] = "group"
+            result['group_name'] = match_group.group(1).replace('-', ' ')
+            return result
+        # Return None or empty dict if no pattern matched
+        return result
+
+
+    def get_ldap_groups(self):
+        """
+        Get array of LDAP groups for future manipulation
+        """
+        group_names = [ ]
+        for _, group in self.ldap_obj.search_s(base=self.ldap_group_base_dn,
+                                               scope=ldap.SCOPE_SUBTREE,
+                                               filterstr='(cn=gtlb*)',
+                                               attrlist=['cn', 'description']):
+            if 'cn' in group and group['cn']:
+                group_name = group['cn'][0].decode('utf-8')
+                group_names.append(group_name)
+        return group_names
+
+
+    def get_git_groups(self):
+        """
+        Get array of GitLab groups for future manipulation
+        """
+        git_groups = []
+        for groups in self.gl.groups.list(all=True):
+            groups_name = groups.name.lower()
+            git_groups.append(groups_name)
+        return git_groups
+
+
+    def find_non_existed_groups_in_ldap(self ,ldap_group, git_group):
+        """
+        Find groups that exist in LDAP AD but not in Gitlab
+        """
+        unique_in_array1 = set(ldap_group) - set(git_group)
+        return list(unique_in_array1)
+
+
+    def create_gitlab_groups(self, group):
+        """
+        Create gitlab groups and subgroups if it exists in LDAP AD but not in GitLab
+        """
+        group_type = group['type']
+        group_name = group['group_name']
+        group_name_path = group_name.replace(' ','-')
+        if group_type == "group":
+            logging.info(f'create gitlab group: {group_name}')
+            if self.sync_dry_run:
+                try:
+                    self.gl.groups.create({'name': f'{group_name}','path': f'{group_name_path}'})
+                except Exception as e:
+                    logging.error(e)
+        if group_type == "subgroup":
+            for git_groups in self.gl.groups.list(all=True):
+                if git_groups.name == group['mother_group']:
+                    logging.info(f'create gitlab subgroup: {group_name} in {git_groups.name}' )
+                    if self.sync_dry_run:
+                        try:
+                            self.gl.groups.create({'name': f'{group_name}','path': f'{group_name_path}', 'parent_id': git_groups.id})
+                        except Exception as e:
+                            logging.error(e)
+
+    def sync_ldap_groups(self):
+        """
+        Sync groups and subgroups from LDAP AD to GitLab
+        """
+        logging.info('Getting non-existing groups in GitLab')
+        ldap_group_names = [ ]
+        ldap_groups = self.get_ldap_groups()
+        git_groups_name = self.get_git_groups()
+        for group in ldap_groups:
+            g = self.parse_group_name(group)
+            if 'group_name' in g:
+                ldap_group_names.append(g['group_name'])
+        uniq = self.find_non_existed_groups_in_ldap(ldap_group_names, git_groups_name )
+        if uniq:
+            logging.info(f'This Groups in not exist in GitLab {uniq}')
+            logging.info('Start creating groups...')
+            for uniq_group in uniq:
+                for group in ldap_groups:
+                    g = self.parse_group_name(group)
+                    if 'group_name' in g:
+                        if g['group_name'] == uniq_group:
+                            print (self.create_gitlab_groups(g))
+        else:
+            logging.info('All groups already exist')
+            logging.info('Continue...')
+
+
     def sync_gitlab_users(self):
         """
         Sync users in gitlab.
@@ -279,7 +380,7 @@ class GitlabSync:
                 logging.warning('User %s is not managed by ldap %s',
                                 user.username, self.gitlab_ldap_provider)
                 continue
-
+            logging.warning("Username: %s, LDAP: %s", user.username, self.ldap_gitlab_users) ## Test LDAP
             if user.username not in self.ldap_gitlab_users:
                 if self.is_ldap_user_exist(user.username):
                     self.ban_user(
@@ -287,9 +388,6 @@ class GitlabSync:
                 else:
                     self.delete_user(
                         user, 'Deleted in ldap')
-                continue
-            if user.username in self.expired_ldap_gitlab_users:
-                self.ban_user(user, 'Has expired password')
                 continue
 
             self.unban_user(user)
@@ -310,89 +408,6 @@ class GitlabSync:
                 logging.info('Saving user %s', user.username)
                 if not self.sync_dry_run:
                     user.save()
-            self.sync_ssh_keys(user)
-
-    def sync_ssh_keys(self, user):
-        """
-        Sync ssh keys (Only one direction FreeIPA -> Gitlab)
-        """
-        ipa_ssh_keys = self.ldap_gitlab_users[user.username]['ipaSshPubKey']
-        gitlab_ssh_keys = user.keys.list()
-        key_date = datetime.datetime.now().strftime("%Y-%m-%d")
-        for ipa_ssh_key in ipa_ssh_keys:
-            ipa_ssh_key_decoded = ipa_ssh_key.decode('utf-8')
-            ipa_key_array = ipa_ssh_key_decoded.split()
-            if len(ipa_key_array) < 2:
-                logging.warning("One of ipa keys doesn.t have protocol or key")
-                continue
-            gitlab_key_id = self.is_ipa_key_in_gitlab_keys(
-                ipa_ssh_key_decoded, gitlab_ssh_keys)
-            if gitlab_key_id > 0:
-                logging.info("Find existing key for user %s with id %s",
-                             user.username, gitlab_key_id)
-                continue
-            try:
-                title = f"FreeIPA managed key {key_date}"
-                if len(ipa_key_array) > 2:
-                    title = f"{title} {ipa_key_array[2]}"
-                keyid = -1
-                if not self.sync_dry_run:
-                    key = user.keys.create({'title': title,
-                                            'key': ipa_ssh_key_decoded})
-                    keyid = key.id
-                logging.info("Add key %d for user %s: %s", keyid,
-                             user.username, title)
-            except:  # pylint: disable=bare-except
-                logging.error("Cannot add key for user %s: %s",
-                              user.username, ipa_ssh_key_decoded)
-
-        for gitlab_key in gitlab_ssh_keys:
-            # If this key is not managed by sync and added manually - skip it
-            if not gitlab_key.title.startswith('FreeIPA managed key'):
-                continue
-            is_ipa_key = self.is_gitlab_key_in_ipa_keys(
-                gitlab_key.key, ipa_ssh_keys)
-            if not is_ipa_key:
-                logging.info("Remove key for user %s: %s",
-                             user.username, gitlab_key.title)
-                if not self.sync_dry_run:
-                    gitlab_key.delete()
-
-    def is_gitlab_key_in_ipa_keys(self, gitlab_key, ipa_keys):
-        """
-        Check if gitlab key exist in ipa keys array
-        """
-        g_key_array = gitlab_key.split()
-        if len(g_key_array) < 2:
-            logging.warning(
-                "One of gitlab keys doesn.t have protocol or key")
-            return False
-        for ipa_ssh_key in ipa_keys:
-            ipa_ssh_key_decoded = ipa_ssh_key.decode('utf-8')
-            ipa_key_array = ipa_ssh_key_decoded.split()
-            if len(ipa_ssh_key_decoded.split()) < 2:
-                logging.warning("One of ipa keys doesn.t have protocol or key")
-                continue
-            # indicies: 0 - protocol, 1 - key
-            if ipa_key_array[0] == g_key_array[0] and ipa_key_array[1] == g_key_array[1]:
-                return True
-        return False
-
-    def is_ipa_key_in_gitlab_keys(self, ipa_ssh_key, gitlab_keys):
-        """
-        Check if ipa key exist in gitlab keys array
-        """
-        ipa_key_array = ipa_ssh_key.split()
-        for g_key in gitlab_keys:
-            g_key_array = g_key.key.split()
-            if len(g_key_array) < 2:
-                logging.warning(
-                    "One of gitlab keys doesn.t have protocol or key")
-                continue
-            # indicies: 0 - protocol, 1 - key
-            if ipa_key_array[0] == g_key_array[0] and ipa_key_array[1] == g_key_array[1]:
-                return g_key.id
-        return -1
 
     def get_gitlab_user_by_username(self, username):
         """
@@ -409,7 +424,7 @@ class GitlabSync:
         """
         if member['object'].access_level != abs(access_level):
             logging.info("Update access level for %s in group %s: %d->%d",
-                         member["username"], group.full_name, member['object'].access_level, abs(access_level))
+                         member["username"], group.name, member['object'].access_level, abs(access_level))
             member['object'].access_level = abs(access_level)
             if not self.sync_dry_run:
                 member['object'].save()
@@ -422,16 +437,16 @@ class GitlabSync:
             group.members.create(
                 {'user_id': user.id, 'access_level': abs(level)})
         logging.info("Add %s(id=%d) to group %s with level %d",
-                     user.username, user.id, group.full_name, abs(level))
+                     user.username, user.id, group.name, abs(level))
 
-    def remove_gitlab_group_member(self, groupname, member):
+    def remove_gitlab_group_member(self, groupname, user):
         """
         Remove member from gitlab group
         """
         logging.info("Remove %s from group %s",
-                     member['username'], groupname)
+                     user['username'], groupname)
         if not self.sync_dry_run:
-            member['object'].delete()
+            user['object'].delete()
 
     def get_ldap_group_access_level_by_name(self, groupname):
         """
@@ -447,23 +462,36 @@ class GitlabSync:
             return gitlab.const.REPORTER_ACCESS
         if groupname.endswith('-guest'):
             return gitlab.const.GUEST_ACCESS
-        return -self.gitlab_group_default_access_level
+        return -gitlab.const.DEVELOPER_ACCESS
 
-    def get_ldap_gitlab_group_members(self, groupname):
+    def get_ldap_gitlab_group_members(self, groupname, group_type, mother_group=""):
         """
         Return members from ldap with access levels
         """
-        gitlab_groups_prefix = f"cn={self.ldap_gitlab_group_prefix}{groupname}"
-        gitlab_groups_filter = ''.join([
-            "(|",
-            f"({gitlab_groups_prefix})",
-            f"({gitlab_groups_prefix}-owner)",
-            f"({gitlab_groups_prefix}-maintainer)",
-            f"({gitlab_groups_prefix}-developer)",
-            f"({gitlab_groups_prefix}-reporter)",
-            f"({gitlab_groups_prefix}-guest)",
-            ")"
-        ])
+        if group_type == 'group':
+            gitlab_groups_prefix = f"cn={self.ldap_gitlab_group_prefix}{groupname}"
+            gitlab_groups_filter = ''.join([
+                "(|",
+                f"({gitlab_groups_prefix})",
+                f"({gitlab_groups_prefix}-owner)",
+                f"({gitlab_groups_prefix}-maintainer)",
+                f"({gitlab_groups_prefix}-developer)",
+                f"({gitlab_groups_prefix}-reporter)",
+                f"({gitlab_groups_prefix}-guest)",
+                ")"
+            ])
+        if group_type == 'subgroup':
+            gitlab_subgroups_prefix = f"cn={self.ldap_gitlab_subgroup_prefix}{mother_group}-{groupname}"
+            gitlab_groups_filter = ''.join([
+                "(|",
+                f"({gitlab_subgroups_prefix})",
+                f"({gitlab_subgroups_prefix}-owner)",
+                f"({gitlab_subgroups_prefix}-maintainer)",
+                f"({gitlab_subgroups_prefix}-developer)",
+                f"({gitlab_subgroups_prefix}-reporter)",
+                f"({gitlab_subgroups_prefix}-guest)",
+                ")"
+            ])
 
         # Find all gitlab groups in ldap
         ldap_members = {}
@@ -489,16 +517,15 @@ class GitlabSync:
                                                     scope=ldap.SCOPE_SUBTREE,
                                                     filterstr=(
                                                         self.groups_memberof_filter % g),
-                                                    attrlist=['uid'])
+                                                    attrlist=['sAMAccountName'])
             #  No members
             if len(members_search) == 0:
                 continue
 
             for member in members_search:
-                # logging.error(member)
                 _, member_data = member
-                if 'uid' in member_data:
-                    for x in member_data['uid']:
+                if 'sAMAccountName' in member_data:
+                    for x in member_data['sAMAccountName']:
                         uid = x.decode('utf-8')
                         if uid not in ldap_members:
                             ldap_members[uid] = {
@@ -522,79 +549,97 @@ class GitlabSync:
             })
         return members
 
+    def sync_groups(self, group, ldap_members):
+        gitlab_group_members = self.get_gitlab_group_members(group)
+
+        # pylint: disable=invalid-name
+        for m in gitlab_group_members:
+            # Check if member not in ldap group
+            if m['username'] in ldap_members:
+                continue
+            user = self.get_gitlab_user_by_username(m['username'])
+            # If user bot or not managed by current provider,
+            # we cannot remove it
+            if user.bot:
+                logging.warning('User %s is bot', user.username)
+                continue
+            current_ldap_provider_user_dn = ''
+            for i in user.identities:
+                if i['provider'] == self.gitlab_ldap_provider:
+                    current_ldap_provider_user_dn = i['extern_uid']
+                    break
+            if not current_ldap_provider_user_dn:
+                logging.warning('Member %s is not managed by ldap %s',
+                                user.username, self.gitlab_ldap_provider)
+                continue
+            self.remove_gitlab_group_member(group.name, m)
+
+        root_member = next((
+            item for item in gitlab_group_members if item["username"] == 'root'), None)
+        root = self.get_gitlab_user_by_username('root')
+        if not root_member:
+            # Root user must be owner on all groups which synced
+            self.create_gitlab_group_member(
+                group, root, gitlab.const.OWNER_ACCESS)
+
+        # If root has access level lesser than owner - fix it
+        if root_member:
+            self.fix_gitlab_group_member_access(group,
+                                                root_member, gitlab.const.OWNER_ACCESS)
+
+        for username, data in ldap_members.items():
+            # If member exist in ldap group and not in gitlab - we need to add
+            member = next((
+                item for item in gitlab_group_members if item["username"] == username), None)
+            if member is None:
+                user = self.get_gitlab_user_by_username(username)
+                # If user never login - he.s account are not created in gitlab
+                # and we cannot add user to group, because we not create
+                # accounts while sync
+                if user is None:
+                    logging.warning(
+                        "User %s can.t be added to group %s because it not exist in gitlab. "
+                        "User need to login before sync", username, group.name)
+                    continue
+                # If user is member and exist in gitlab - add as developer member
+                self.create_gitlab_group_member(
+                    group, user, data['access_level'])
+            else:
+                # logging.info(member["object"])
+                # logging.info(member['object'].access_level)
+                self.fix_gitlab_group_member_access(
+                    group, member, data['access_level'])
+
     def sync_gitlab_groups(self):
         """
         Sync groups in gitlab.
         """
-        # TODO: Сделать вложенные группы
         logging.info('Sync groups')
         # gitlab_groups = {}
         for group in self.gl.groups.list(all=True):
-            group_name = group.full_path
-            logging.info('Sync group %s', group_name)
-            # Name of group in ldap
-            ldap_group_name = group_name.replace("/", "--")
+            logging.info('Sync group %s', group.name)
             ldap_members, is_exist = self.get_ldap_gitlab_group_members(
-                ldap_group_name)
+                group.name, group_type="group")
             # Group is not managed by ldap
             if not is_exist:
                 continue
+            self.sync_groups(group=group,ldap_members=ldap_members)
 
-            gitlab_group_members = self.get_gitlab_group_members(group)
-            # pylint: disable=invalid-name
-            for m in gitlab_group_members:
-                # Check if member not in ldap group
-                if m['username'] in ldap_members:
+    def sync_gitlab_subgroups(self):
+        """
+        Sync subgroups in gitlab.
+        """
+        logging.info('Sync subgroups')
+        # gitlab_groups = {}
+        for group in self.gl.groups.list(all=True):
+            subgroups = group.subgroups.list()
+            for subgroup_id in subgroups:
+                real_group = self.gl.groups.get(subgroup_id.id)
+                #logging.info(' subgroup rl %s', rl)
+                ldap_members, is_exist = self.get_ldap_gitlab_group_members(
+                    real_group.name, group_type="subgroup", mother_group=group.name)
+                # Group is not managed by ldap
+                if not is_exist:
                     continue
-                user = self.get_gitlab_user_by_username(m['username'])
-                # If user bot or not managed by current provider,
-                # we cannot remove it
-                if user.bot:
-                    logging.warning('User %s is bot', user.username)
-                    continue
-                current_ldap_provider_user_dn = ''
-                for i in user.identities:
-                    if i['provider'] == self.gitlab_ldap_provider:
-                        current_ldap_provider_user_dn = i['extern_uid']
-                        break
-                if not current_ldap_provider_user_dn:
-                    logging.warning('Member %s is not managed by ldap %s',
-                                    user.username, self.gitlab_ldap_provider)
-                    continue
-                self.remove_gitlab_group_member(group_name, m)
 
-            root_member = next((
-                item for item in gitlab_group_members if item["username"] == 'root'), None)
-            root = self.get_gitlab_user_by_username('root')
-            if not root_member:
-                # Root user must be owner on all groups which synced
-                self.create_gitlab_group_member(
-                    group, root, gitlab.const.OWNER_ACCESS)
-
-            # If root has access level lesser than owner - fix it
-            if root_member:
-                self.fix_gitlab_group_member_access(group,
-                                                    root_member, gitlab.const.OWNER_ACCESS)
-
-            for username, data in ldap_members.items():
-                # If member exist in ldap group and not in gitlab - we need to add
-                member = next((
-                    item for item in gitlab_group_members if item["username"] == username), None)
-                if member is None:
-                    user = self.get_gitlab_user_by_username(username)
-                    # If user never login - he.s account are not created in gitlab
-                    # and we cannot add user to group, because we not create
-                    # accounts while sync
-                    if user is None:
-                        logging.warning(
-                            "User %s can.t be added to group %s because it not exist in gitlab. "
-                            "User need to login before sync", username, group_name)
-                        continue
-                    # If user is member and exist in gitlab - add as developer member
-                    self.create_gitlab_group_member(
-                        group, user, data['access_level'])
-                else:
-                    # logging.info(member["object"])
-                    # logging.info(member['object'].access_level)
-                    self.fix_gitlab_group_member_access(
-                        group, member, data['access_level'])
+                self.sync_groups(group=real_group,ldap_members=ldap_members)
