@@ -5,16 +5,16 @@
 ## Sync
 
 - Users
-  - They are not created automatically
+  - Сreated automatically
   - The user name is synchronized (From the DisplayName property)
   - The administrator status is synchronized (Based on group membership)
   - They are blocked (*ban) if they are excluded from the LDAP_GITLAB_USERS_GROUP group or have a password that expired more than 2 days ago. Unlock if the membership condition is met and the password has not expired.
-  - SSH keys are synchronized (From the ipaSshPubKey property, synchronized keys have the prefix 'FreeIPA managed key')
   - Deleted if the account is missing in ldap
 - Groups
   - Automatic create group from LDAP AD if it not exists in GitLab
   - Automatic create subgroup in group from LDAP AD if it not exists in GitLab
   - Sync role depends on group naming. If ACCESS_LEVEL is not specified using default role - Developer
+  - Supports only unique subgroup names
 
 
   
@@ -39,7 +39,7 @@ Configuration via environment variables
 - GITLAB_API_URL: Url for accessing Gitlab (Approx. - <https://gitlab.example.com >)
 - GITLAB_TOKEN: Token for working with the Gitlab API
 - GITLAB_LDAP_PROVIDER: The provider name specified in the ldap configuration for Gitlab
-- LDAP_URL: URL for FreeIPA (Approx. - ldap://ipa.example.com)
+- LDAP_URL: 
 - LDAP_USERS_BASE_DN: Base DN for users
 - LDAP_GROUP_BASE_DN: Base DN for groups
 - LDAP_BIND_DN: Bind DN in LDAP
